@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import time, timedelta
+import asyncio
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -34,31 +35,38 @@ def default_data():
 def load():
     if not os.path.exists(FILE):
         return default_data()
-    with open(FILE, encoding="utf-8") as f:
-        d = json.load(f)
-    for k, v in default_data().items():
-        d.setdefault(k, v)
-    return d
+    try:
+        with open(FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        for k, v in default_data().items():
+            d.setdefault(k, v)
+        return d
+    except Exception as e:
+        print("load error:", e)
+        return default_data()
 
 
 def save(d):
-    with open(FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+    try:
+        with open(FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("save error:", e)
 
 
 def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == config.ADMIN_ID
 
 
-async def notify_admin(context, text):
+async def notify_admin(bot, text):
     try:
-        await context.bot.send_message(config.ADMIN_ID, text)
+        await bot.send_message(config.ADMIN_ID, text)
     except Exception as e:
         print("notify error:", e)
 
 
 # ========== پیش‌نمایش ==========
-async def send_preview(context: ContextTypes.DEFAULT_TYPE):
+async def send_preview(bot):
     d = load()
     ids = d["file_ids"]
     idx = d["index"]
@@ -76,19 +84,19 @@ async def send_preview(context: ContextTypes.DEFAULT_TYPE):
     )
     try:
         if d.get("poster_id"):
-            await context.bot.send_photo(
+            await bot.send_photo(
                 chat_id=config.CHANNEL_ID,
                 photo=d["poster_id"],
                 caption=text
             )
         else:
-            await context.bot.send_message(config.CHANNEL_ID, text)
+            await bot.send_message(config.CHANNEL_ID, text)
     except Exception as e:
         print("preview error:", e)
 
 
 # ========== ارسال قسمت ==========
-async def send_next(context: ContextTypes.DEFAULT_TYPE):
+async def send_next(bot):
     d = load()
     ids = d["file_ids"]
     idx = d["index"]
@@ -97,22 +105,21 @@ async def send_next(context: ContextTypes.DEFAULT_TYPE):
         if ids and not d.get("finished_notified"):
             d["finished_notified"] = True
             save(d)
-            await context.bot.send_message(
+            await bot.send_message(
                 config.CHANNEL_ID,
                 f"🎬 پخش سریال «{d['series_name']}» به پایان رسید.\n"
                 f"منتظر سریال جدید باشید…"
             )
             await notify_admin(
-                context,
+                bot,
                 f"✅ سریال «{d['series_name']}» تموم شد.\n"
                 f"برای سریال جدید /newseries بزن."
             )
         return
 
-    # ویدیو تیزر
     if d.get("send_teaser") and d.get("teaser_video_id"):
         try:
-            await context.bot.send_video(
+            await bot.send_video(
                 chat_id=config.CHANNEL_ID,
                 video=d["teaser_video_id"],
                 caption=f"🎬 «{d['series_name']}»\n#پیش_نمایش"
@@ -120,18 +127,17 @@ async def send_next(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print("teaser error:", e)
 
-    # قسمت اصلی
     file_id = ids[idx]
     caption = f"🎬 {d['series_name']} — قسمت {idx + 1} از {len(ids)}"
     try:
-        await context.bot.send_video(
+        await bot.send_video(
             chat_id=config.CHANNEL_ID,
             video=file_id,
             caption=caption,
         )
     except Exception as e:
         print("error:", e)
-        await notify_admin(context, f"❌ خطا در قسمت {idx+1}: {e}")
+        await notify_admin(bot, f"❌ خطا در قسمت {idx+1}: {e}")
         return
 
     d["index"] = idx + 1
@@ -141,40 +147,54 @@ async def send_next(context: ContextTypes.DEFAULT_TYPE):
     if d["index"] >= len(ids) and not d.get("finished_notified"):
         d["finished_notified"] = True
         save(d)
-        await context.bot.send_message(
+        await bot.send_message(
             config.CHANNEL_ID,
             f"🎬 پخش سریال «{d['series_name']}» به پایان رسید.\n"
             f"منتظر سریال جدید باشید…"
         )
         await notify_admin(
-            context,
+            bot,
             f"✅ سریال «{d['series_name']}» تموم شد.\n"
             f"برای سریال جدید /newseries بزن."
         )
 
 
-# ========== زمان‌بندی ==========
-def schedule_jobs(app):
-    d = load()
+# ========== زمان‌بندی با asyncio ==========
+async def scheduler_loop(bot):
+    last_daily = None
+    last_preview = None
     tz = ZoneInfo(config.TIMEZONE)
-    for j in app.job_queue.get_jobs_by_name("daily"):
-        j.schedule_removal()
-    for j in app.job_queue.get_jobs_by_name("preview"):
-        j.schedule_removal()
 
-    app.job_queue.run_daily(
-        send_next,
-        time=time(d["hour"], d["minute"], tzinfo=tz),
-        name="daily"
-    )
+    await asyncio.sleep(5)  # صبر برای آماده شدن ربات
 
-    total = (d["hour"] * 60 + d["minute"] - config.PREVIEW_MINUTES_BEFORE) % (24 * 60)
-    ph, pm = total // 60, total % 60
-    app.job_queue.run_daily(
-        send_preview,
-        time=time(ph, pm, tzinfo=tz),
-        name="preview"
-    )
+    while True:
+        try:
+            d = load()
+            now = datetime.now(tz)
+
+            preview_total = (d["hour"] * 60 + d["minute"] - config.PREVIEW_MINUTES_BEFORE) % (24 * 60)
+            ph, pm = preview_total // 60, preview_total % 60
+
+            if now.hour == d["hour"] and now.minute == d["minute"]:
+                if last_daily != now.date():
+                    last_daily = now.date()
+                    print(f"⏰ زمان پخش: {now.strftime('%H:%M')}")
+                    await send_next(bot)
+
+            if now.hour == ph and now.minute == pm:
+                if last_preview != now.date():
+                    last_preview = now.date()
+                    print(f"🎬 پیش‌نمایش: {now.strftime('%H:%M')}")
+                    await send_preview(bot)
+        except Exception as e:
+            print("scheduler error:", e)
+
+        await asyncio.sleep(30)
+
+
+async def post_init(app):
+    asyncio.create_task(scheduler_loop(app.bot))
+    print("✅ اسکجولر شروع شد.")
 
 
 # ========== دستورات ==========
@@ -188,13 +208,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "→ ویدیوها رو فوروارد کن\n"
         "/done — پایان دریافت\n\n"
         "🎬 پیش‌نمایش:\n"
-        "/setteaser — ارسال ویدیو تیزر\n"
-        "/setposter — ارسال عکس پوستر\n"
-        "/teaser on|off — روشن/خاموش تیزر\n"
-        "/poster on|off — روشن/خاموش پوستر\n\n"
+        "/setteaser /setposter\n"
+        "/teaser on|off /poster on|off\n\n"
         "⚙️ مدیریت:\n"
         "/status /list /settime HH:MM\n"
-        "/postnow /skip /rename نام /clear"
+        "/postnow /skip /rename /clear"
     )
 
 
@@ -202,10 +220,8 @@ async def new_series(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     d = load()
-    d.update({
-        "file_ids": [], "index": 0,
-        "finished_notified": False, "collecting": True,
-    })
+    d.update({"file_ids": [], "index": 0,
+              "finished_notified": False, "collecting": True})
     save(d)
     await update.message.reply_text(
         "🆕 حالت دریافت فعال شد.\nویدیوها رو به ترتیب فوروارد کن و بعد /done بزن."
@@ -300,7 +316,6 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = load()
     d["hour"], d["minute"] = h, m
     save(d)
-    schedule_jobs(context.application)
     await update.message.reply_text(f"✅ ساعت پخش: {h:02d}:{m:02d}")
 
 
@@ -308,7 +323,7 @@ async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     await update.message.reply_text("📤 ارسال...")
-    await send_next(context)
+    await send_next(context.bot)
 
 
 async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,7 +354,6 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     save(default_data())
-    schedule_jobs(context.application)
     await update.message.reply_text("🗑 همه چیز پاک شد.")
 
 
@@ -382,9 +396,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not d.get("collecting") and d["file_ids"] and d["index"] < len(d["file_ids"]):
-        return await msg.reply_text(
-            "⚠️ سریال فعلی در حال پخشه!\nاول /newseries بزن."
-        )
+        return await msg.reply_text("⚠️ سریال فعلی در حال پخشه!\nاول /newseries بزن.")
 
     d["file_ids"].append(fid)
     save(d)
@@ -393,7 +405,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== اجرا ==========
 def main():
-    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    app = ApplicationBuilder().token(config.BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newseries", new_series))
@@ -415,7 +427,6 @@ def main():
         handle_media
     ))
 
-    schedule_jobs(app)
     print("🤖 ربات روشن شد...")
     app.run_polling()
 
