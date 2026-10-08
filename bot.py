@@ -165,7 +165,7 @@ async def scheduler_loop(bot):
     last_preview = None
     tz = ZoneInfo(config.TIMEZONE)
 
-    await asyncio.sleep(5)  # صبر برای آماده شدن ربات
+    await asyncio.sleep(5)
 
     while True:
         try:
